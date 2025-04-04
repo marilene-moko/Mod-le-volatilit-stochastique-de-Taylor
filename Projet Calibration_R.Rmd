@@ -1,0 +1,376 @@
+---
+title: "Projet Calibration"
+author: "Niyo D. JC"
+date: "2025-02-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### 1. Simulation des données
+
+```{r}
+n <- 5000  
+phi0 <- 0.7        # Paramètre AR(1) pour X
+sigma0_sq <- 0.3 
+mu <- 0
+beta <- 1 / (sqrt(5)* pi)
+var_log_eps2 <- (beta^2)*(pi^2) / 2
+
+set.seed(102)   
+xi <- rnorm(n, mean = 0, sd = 1)  # Bruit xi (normalisé)
+# xi <- rlnorm(n, meanlog = 0, sdlog = 1)
+eta <- rnorm(n, mean = 0, sd = sqrt(sigma0_sq))  # Bruit eta
+
+# Simulation du processus X (AR(1))
+X <- numeric(n)
+X[1] <- rnorm(1, mean = 0, sd = sqrt(sigma0_sq / (1 - phi0^2)))  # Initialisation stationnaire
+for (i in 2:n) {
+  X[i] <- mu + phi0 * X[i-1] + eta[i]
+}
+
+# Simulation des rendements R
+# R <- exp(X / 2) * xi^beta
+
+# Construction des données Y
+Y <- X + beta*log(xi^2) - beta*(-1.27) # Log-transformation
+# Y <- X + rnorm(n, mean = 0, sd = sqrt(var_log_eps2))
+```
+
+```{r}
+data_plot <- data.frame(
+  Time = 1:n,
+  Volatility = X,
+  Log_SV = Y
+)
+
+# Tracé des graphiques
+par(mfrow = c(2, 1), mar = c(3, 4, 2, 1))
+
+plot(data_plot$Time, data_plot$Volatility, type = "l", col = "red", 
+     main = "Trajectoire de la Volatilité", xlab = "Temps", ylab = "e^(X/2)")
+
+plot(data_plot$Time, data_plot$Log_SV, type = "l", col = "green", 
+     main = "Trajectoire du Log-SV", xlab = "Temps", ylab = "X")
+```
+
+### 2. Fonctions nécessaires pour l'estimation
+
+#### Transformée de Fourier des bruits ξ
+
+```{r}
+# Fonction pour calculer f_xi^*(x)
+f_xi_star <- function(x, beta) {
+  E <- -1.27 * beta
+  (1 / sqrt(pi)) * 2^(1i * beta * x) * gamma(1/2 + 1i * beta * x) * exp(-1i * E * x)
+}
+```
+
+#### Fonction de déconvolution ulθ(y)
+
+```{r}
+library(gsl)
+library(pracma)
+# Fonction pour calculer u_{l_theta}(y)
+u_l_theta <- function(y, phi, gamma, beta) {
+  E <- -1.27 * beta
+  z <- 1/2 + 1i * beta * y  # Argument complexe pour la fonction gamma
+  
+  # Calcul de Gamma(1/2 + i * beta * y)
+  gamma_z <- exp(lngamma_complex(z))
+  
+  # Termes de la fonction de déconvolution
+  term1 <- -1i*phi * y * (gamma^2) * exp(-0.5 * (y^2)*(gamma^2))
+  term2 <- 2*exp(-1i * E * y) * (2^(1i * beta * y)) * gamma_z*sqrt(pi)
+  
+  # Résultat final (conserver le nombre complexe)
+  (term1 / term2)
+}
+```
+
+#### Critère empirique à minimiser
+
+```{r}
+# Fonction pour calculer le critère empirique
+inverse_fourier_ul_theta <- function(y, phi, gamma, beta) {
+  integrand <- function(t) {
+    exp(1i * y * t) * u_l_theta(t, phi, gamma, beta) #deconvolution_ul_theta(t, theta, beta)
+  }
+  quad(integrand, -15, 15)
+}
+
+critere_empirique <- function(theta, Y, beta) {
+  phi <- theta[1]
+  sigma_sq <- theta[2]
+  gamma <- sqrt(sigma_sq / (1 - phi^2))
+  
+  # Terme ||l_theta||^2 (réel)
+  norm_l_theta_sq <- ((phi^2) * gamma) / (4 * sqrt(pi))
+  
+  # Terme somme des Y_{i+1} u_{l_theta}^*(Y_i) (complexe)
+  sum_term <- 0
+  for (i in 1:(length(Y) - 1)) {
+    u_star <-   inverse_fourier_ul_theta(Y[i], phi, gamma, beta) #  fft(u_l_theta(Y[i], phi, gamma, beta)) #
+    sum_term <- sum_term + Y[i+1] * Re(u_star)
+  }
+  
+  # Critère empirique (convertir en réel)
+  (norm_l_theta_sq - (2 / length(Y)) * sum_term)  # Prendre la partie réelle
+}
+```
+
+```{r}
+critere_empirique_gauss <- function(theta, Y, beta) {
+  phi <- theta[1]
+  sigma_sq <- theta[2]
+  gamma <- sqrt(sigma_sq / (1 - phi^2))
+  var_log_eps2 <- (beta^2)*(pi^2) / 2
+  dif_gam <- (gamma^2 - var_log_eps2)
+  # Terme ||l_theta||^2 (réel)
+  norm_l_theta_sq <- ((phi^2) * gamma) / (4 * sqrt(pi))
+  
+  # Terme somme des Y_{i+1} u_{l_theta}^*(Y_i) (complexe)
+  sum_term <- 0
+  for (i in 1:(length(Y) - 1)) {
+    num <- phi*(gamma^2)*Y[i]*exp(-0.5*(Y[i]^2)/dif_gam)
+    den <- sqrt(2*pi)*dif_gam^1.5
+    u_star <-  num/den
+    sum_term <- sum_term + Y[i+1] * u_star
+  }
+  
+  # Critère empirique (convertir en réel)
+  (norm_l_theta_sq - (2 / length(Y)) * sum_term)  # Prendre la partie réelle
+}
+```
+
+```{r}
+library(ggplot2)
+
+# Paramètres (ajuste selon ton modèle)
+phi <- 0.7
+gamma <- sqrt(0.3 / (1 - phi^2))
+beta <- beta
+
+# Génération des valeurs de t
+t_values <- seq(-20, 20, length.out = 1000)
+
+# Calcul des valeurs de u_l_theta
+u_values <- sapply(t_values, function(t) Re(u_l_theta(t, phi, gamma, beta)))
+
+# Création du dataframe pour ggplot
+df <- data.frame(t = t_values, u_l_theta = u_values)
+
+# Tracé de la fonction
+ggplot(df, aes(x = t, y = u_l_theta)) +
+  geom_line(color = "blue") +
+  ggtitle("Visualisation de u_l_theta(t, phi, gamma, beta)") +
+  xlab("t") + ylab("u_l_theta") +
+  theme_minimal()
+
+```
+
+### 3. Estimation des paramètres
+
+```{r}
+# Plage d'initialisation pour theta
+theta_min <- c(-0.9, 0.1) 
+theta_max <- c(0.9, 1.0)
+
+# Fonction objectif pour la minimisation
+objective_function <- function(theta) {
+  critere_empirique_gauss(theta, Y, beta)
+}
+
+# Minimisation avec optim
+result <- optim(
+  par = c(0.5, 0.2),  # Initialisation arbitraire
+  fn = objective_function,
+  method = "L-BFGS-B",
+  lower = theta_min,
+  upper = theta_max
+)
+
+# Paramètres estimés
+theta_hat <- result$par
+phi_hat <- theta_hat[1]
+sigma_sq_hat <- theta_hat[2]
+
+# Affichage des résultats
+# phi_hat = 0.7229636
+# sigma_sq_hat = 0.2765444
+# -0.05504766
+cat("Paramètres estimés :\n")
+cat("phi_hat =", phi_hat, "\n")
+cat("sigma_sq_hat =", sigma_sq_hat, "\n")
+```
+
+### Quasi Maximum de vraisemblance
+
+```{r}
+# Fonction pour le filtre de Kalman
+kalman_filter <- function(y_t, theta, beta) {
+  phi <- theta[1]
+  sigma2 <- theta[2]
+  mu <- theta[3]
+  sigma <- sqrt(sigma2)
+  n <- length(y_t)
+  var_log_eps2 <- (beta^2)*(pi^2) / 2
+  
+  x_hat <- numeric(n)
+  P <- numeric(n)
+  
+  # Conditions initiales
+  x_hat[1] <- mu / (1 - phi)
+  P[1] <- sigma2 / (1 - phi^2)
+  
+  v_t <- numeric(n)
+  F_t <- numeric(n)
+  rap_t <- numeric(n)
+  
+  for (t in 2:n) {
+    # Étape de prédiction
+    x_hat_pred <- mu + phi * x_hat[t-1]
+    P_pred <- phi^2 * P[t-1] + sigma2
+    y_hat_pred <- x_hat_pred
+    
+    # Innovation et variance de l'innovation
+    v_t[t] <- y_t[t] - y_hat_pred
+    F_t[t] <- P_pred + var_log_eps2
+    rap_t[t] <- (v_t[t]^2) / F_t[t]
+    
+    # Mise à jour
+    K_t <- P_pred / F_t[t]
+    x_hat[t] <- x_hat_pred + K_t * v_t[t]
+    P[t] <- (1 - K_t) * P_pred
+  }
+  
+  return(list(x_hat = x_hat, v_t = v_t[-1], F_t = F_t[-1], rap_t = rap_t[-1]))  # On ignore t=1 car pas de données pour l'innovation
+}
+
+```
+
+```{r}
+# Fonction de log-vraisemblance quasi maximale
+qml_log_likelihood <- function(theta, y_t, beta) {
+  result <- kalman_filter(y_t, theta, beta)
+  v_t <- result$v_t
+  F_t <- result$F_t
+  rap_t <- result$rap_t
+  
+  n <- length(v_t)
+  log_likelihood <- -(n / 2) * log(2 * pi) - 0.5 * sum(log(F_t)) - 0.5 * sum(rap_t)
+  return(-log_likelihood)  # On minimise donc on retourne l'opposé
+}
+
+estimate_theta_qml <- function(y_t, initial_guess, beta) {
+  result <- optim(par = initial_guess, fn = qml_log_likelihood, y_t = y_t, beta=beta, method = "L-BFGS-B", lower = c(-0.9, 0.1,-0.9), upper = c(0.9, 1,0.9))
+  return(list(theta_hat = result$par, success = result$convergence == 0))
+}
+
+initial_guess <- c(0.5, 0.1, 0.1)  
+result <- estimate_theta_qml(Y, initial_guess, beta)
+print(result$theta_hat)
+```
+
+### Approche Bayesienne MCMC
+
+```{r}
+# Charger les packages
+library(rjags)
+library(ggmcmc)
+```
+
+```{r}
+model_string <- "
+model {
+  # Prior distributions
+  phi ~ dunif(-0.9, 0.9)  # Coefficient AR, contraint à être stationnaire
+  sigma_sq ~ dunif(0, 1)  # Variance du bruit eta
+
+  # Initialisation de X
+  X[1] ~ dnorm(0, 1 / sigma_sq)
+
+  # Processus AR pour X
+  for (i in 2:N) {
+    X[i] ~ dnorm(phi * X[i-1], 1 / sigma_sq)
+  }
+
+  # Observations Y
+  for (i in 1:N) {
+    Y[i] ~ dnorm(X[i], 2 / ((beta^2)*(3.141593^2)))
+  }
+}
+"
+writeLines(model_string, con="modele.bug")
+```
+
+```{r}
+# Données pour JAGS
+data_list <- list(
+  Y = Y,  # Données Y générées précédemment
+  N = length(Y),  # Nombre d'observations
+  beta = beta  # Paramètre beta
+)
+
+# Initialisation des chaînes de Markov
+inits <- list(
+  list(phi = 0.5, sigma_sq = 0.2),
+  list(phi = 0.8, sigma_sq = 0.4)
+)
+
+n.chains <- 2
+burnin <- 5000
+n.iter <- 20000
+```
+
+```{r}
+options(width = 60)
+myJAGSmodel<- jags.model(file="modele.bug", 
+                         data=data_list,
+                         inits=inits, 
+                         n.chains = n.chains)
+update(myJAGSmodel,burnin)
+```
+
+```{r}
+samples <- coda.samples(myJAGSmodel, variable.names = c("phi", "sigma_sq"), n.iter = n.iter)
+```
+
+```{r}
+# Résumé des échantillons
+summary(samples)
+```
+
+```{r}
+# Tracés des chaînes de Markov
+plot(samples)
+```
+
+```{r}
+# Vérification de la convergence avec le critère de Gelman-Rubin
+gelman.diag(samples)
+```
+
+#### Calculer la statistique de Gelman-Rubin
+
+Regarder les fonctions `ggs_Rhat` et `ggs_grb` du package `ggmcmc`. Les utiliser pour calculer le critère de Gelman-Rubin (Potential scale reduction statistic $\hat{R}$ ainsi que son évolution au fil des itérations post période de chauffe.
+
+-   Rappel règle: $\hat{R} < 1.05$ + stabilité au fil des itérations $\Rightarrow$ Pas de problème de convergence majeur diagnostiqué selon ce critère
+
+-   Calcul du critère sur l'ensemble des itérations de chaque chaîne de Markov
+
+```{r}
+samples.gg <- ggs(samples)
+ggs_Rhat(samples.gg,scaling=1.2,version_rhat = "BDA2", plot=FALSE)
+```
+
+```{r}
+ggs_autocorrelation(samples.gg)
+```
+
+```{r}
+ess <- ggs_effective(samples.gg, proportion = FALSE, plot = FALSE)
+ess
+```
